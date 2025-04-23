@@ -163,8 +163,8 @@ def generatePCD(camera, frames):
 
         return pcd
 
-def checkForObstacles():
-    pcd = generatePCD()
+def checkForObstacles(camera, frames):
+    pcd = generatePCD(camera, frames)
     points = np.asarray(pcd.points)
 
     # Downsample the point cloud for efficiency
@@ -523,7 +523,7 @@ try:
                                 turn_to(initial_theta)
                             elif abs(pose[2] - initial_theta) < 5:
                                 initially_turning = False
-                                distance_to_obstacle = checkForObstacles()
+                                distance_to_obstacle = checkForObstacles("realsense-247122073398", frames)
                                 if distance_to_obstacle is not None and distance_to_obstacle > 0.5:
                                     temp_waypoint_x = pose[0] + (distance_to_obstacle - 0.5) * np.sin(np.radians(pose[2]))
                                     temp_waypoint_y = pose[1] + (distance_to_obstacle - 0.5) * np.cos(np.radians(pose[2]))
