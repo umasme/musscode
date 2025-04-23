@@ -7,6 +7,7 @@ import contextlib
 import time
 import pyrealsense2 as rs  # Added RealSense library
 from pysabertooth import Sabertooth
+import open3d as o3d
 
 ''' TODO:
 1. check theta returned from aruco detection is accurate
@@ -135,6 +136,98 @@ def createPipeline():
 
 def timeDeltaToMilliS(delta) -> float:
         return delta.total_seconds() * 1000
+
+def generatePCD(camera, frames):
+    depth_frame = frames[camera].get_depth_frame()
+    if depth_frame:
+        pc = rs.pointcloud()
+        points = pc.calculate(depth_frame)
+        # Extract vertices and colors
+        vertices = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)  # 3D points
+        colors = np.asanyarray(points.get_texture_coordinates()).view(np.float32).reshape(-1, 2)  # Texture mapping
+
+        # Normalize colors
+        colors_rgb = []
+        for tex_coords in colors:
+            u, v = tex_coords[0], tex_coords[1]
+            if 0 <= u < 1 and 0 <= v < 1:  # Ensure valid texture coordinates
+                x = int(u * color_frame.get_width())
+                y = int(v * color_frame.get_height())
+                colors_rgb.append(color_image[y, x] / 255.0)  # Normalize to 0-1
+            else:
+                colors_rgb.append([0, 0, 0])  # Default color for invalid texture coordinates
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vertices)
+        pcd.colors = o3d.utility.Vector3dVector(colors_rgb)
+
+        return pcd
+
+def checkForObstacles():
+    pcd = generatePCD()
+    points = np.asarray(pcd.points)
+
+    # Downsample the point cloud for efficiency
+    pcd = pcd.voxel_down_sample(voxel_size=0.05)
+
+    # Perform plane segmentation using RANSAC to find the ground plane
+    plane_model, inliers = pcd.segment_plane(distance_threshold=0.02,
+                                             ransac_n=3,
+                                             num_iterations=1000)
+    a, b, c, d = plane_model
+
+    # Extract outliers (non-ground points)
+    non_ground_cloud = pcd.select_by_index(inliers, invert=True)
+
+    # Filter out points that are too high or low above the ground plane
+    # Assuming a maximum height of 1 meter above the ground plane for obstacle detection
+    min_height_meters = 0.1
+    max_height_meters = 1.0
+    non_ground_cloud_points = np.asarray(non_ground_cloud.points)
+    distances_to_plane = (a * non_ground_cloud_points[:, 0] + b * non_ground_cloud_points[:, 1] + c * non_ground_cloud_points[:, 2] + d)
+    valid_height_indices = np.where((distances_to_plane <= max_height_meters) & (distances_to_plane >= min_height_meters))[0]
+    non_ground_cloud = non_ground_cloud.select_by_index(valid_height_indices)
+    non_ground_cloud_points = np.asarray(non_ground_cloud.points)
+
+    normal_vector = np.array([a, b, c])
+    normal_vector /= np.linalg.norm(normal_vector)  # Normalize the normal vector
+
+    print(f"Plane equation: {a}x + {b}y + {c}z + {d} = 0")
+
+    camera_forward = np.array([0, 0, 1])  # Assuming camera is looking in the z direction
+
+    #Project camera forward derection onto the ground plane
+    forward_projected = camera_forward - np.dot(camera_forward, normal_vector) * normal_vector
+    if np.linalg.norm(forward_projected) < 1e-6:
+        x_axis = np.array([1, 0, 0])
+        if abs(np.dot(x_axis, normal_vector)) > 0.9:
+            x_axis = np.array([0, 1, 0])
+        x_axis = x_axis - np.dot(x_axis, normal_vector) * normal_vector
+    
+    x_parallel = forward_projected / np.linalg.norm(forward_projected)  # Normalize the projected vector
+    y_parallel = np.cross(normal_vector, x_parallel)  # Cross product to get the y-axis
+    y_parallel /= np.linalg.norm(y_parallel)  # Normalize the y-axis
+    
+    #2D projection of the point cloud onto the ground plane
+    projection_matrix = np.column_stack((x_parallel, y_parallel))
+    points_2d = np.dot(points, projection_matrix.T)  # Project points onto the ground plane
+    rectangle_length = 5.0  # Length of the rectangle in meters
+    rectangle_width = 0.9  # Width of the rectangle in meters
+
+    #Check if within rectangle
+    in_rectangle = np.logical_and(
+        np.logical_and(points_2d[:, 0] >= 0, points_2d[:, 0 <= rectangle_length]),
+                        np.logical_and(points_2d[:, 1] >= -rectangle_width/2, points_2d[:, 1] <= rectangle_width/2))
+    
+    obstacle_points = points[in_rectangle]
+    if len(obstacle_points) > 0:
+        distances = np.dot(obstacle_points, x_parallel)  # Project points onto the x-axis
+        min_distance = np.min(distances)
+        print(f"Closest obstacle is {min_distance:.2f} meters away")
+        return min_distance
+    else:
+        print("No obstacles detected")
+        return None
 
 def localize(color_images, imuQueue, aruco_detector, marker_size, baseTs, prev_gyroTs, camera_position, pose):
     last_print_time = time.time()  # Initialize time tracking
@@ -362,6 +455,7 @@ try:
             print(f"Starting camera with serial number: {serial_number}")
             config.enable_device(serial_number)
             config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
             
             profile = pipeline.start(config)
             realsense_pipelines.append((pipeline, serial_number))
@@ -380,20 +474,23 @@ try:
         i = 0
         waypoint = 0
         at_waypoint = False  # Flag to indicate if the robot has reached the current waypoint
+        initially_turning = True  # Flag to indicate if the robot is initially turning
 
     
 
         while True:
             
             color_images = []
+            frames = {}
             for pipeline, serial_number in realsense_pipelines:
-                frames = pipeline.wait_for_frames()
-                color_frame = frames.get_color_frame()
+                frame = pipeline.wait_for_frames()
+                color_frame = frame.get_color_frame()
                 if color_frame:
                     color_image = np.asanyarray(color_frame.get_data())
                     stream_name = f"realsense-{serial_number}"
                     mxId = f"realsense-{serial_number}"  # Fake ID, update CAMERA_INFOS if needed
                     color_images.append((color_image, stream_name, mxId))
+                    frames.update({mxId : frame}) # Store the frame for later use
             
             for q_rgb, stream_name, mxId in qRgbMap:
                 if q_rgb.has():
@@ -410,16 +507,33 @@ try:
                 print("rotating to find ArUco markers...")
 
 
-            if pose is not None:
+            elif pose is not None:
+                current_time = time.time()
+                if current_time - last_print_time >= 1:
+                    print(print_statement)
+                    last_print_time = current_time  # Update last print time
+    
                 if not at_waypoint:
                     if abs(pose[0] - WAYPOINTS[waypoint][0]) > 0.5 or abs(pose[1] - WAYPOINTS[waypoint][1]) > 0.5:
+                        if initially_turning:
+                            initial_theta = np.degrees(np.atan2(WAYPOINTS[waypoint][1] - pose[1], WAYPOINTS[waypoint][0] - pose[0]))
+                            initial_theta -= 90  # Adjust for camera orientation
+                            initial_theta = initial_theta % 360  # Normalize theta to be between 0 and 360 degrees
+                            if abs(pose[2] - initial_theta) >= 5:
+                                turn_to(initial_theta)
+                            elif abs(pose[2] - initial_theta) < 5:
+                                initially_turning = False
+                                distance_to_obstacle = checkForObstacles()
+                                if distance_to_obstacle is not None and distance_to_obstacle > 0.5:
+                                    temp_waypoint_x = pose[0] + (distance_to_obstacle - 0.5) * np.sin(np.radians(pose[2]))
+                                    temp_waypoint_y = pose[1] + (distance_to_obstacle - 0.5) * np.cos(np.radians(pose[2]))
+                                    temp_waypoint = [temp_waypoint_x, temp_waypoint_y, "temporary"]
+                                    WAYPOINTS.insert(waypoint, temp_waypoint)  # Insert the temporary waypoint before the current waypoint
+                                    print(f"Obstacle detected, moving to temporary waypoint at position {temp_waypoint}")
+                            
+                        elif not initially_turning:
                             move_to(pose, WAYPOINTS[waypoint])
-
-                            current_time = time.time()
-                            if current_time - last_print_time >= 1:
-                                print(pose)
-                                last_print_time = current_time
-                                print("Moving to waypoint")
+                            print_statement = f"Moving to waypoint {waypoint + 1} at position {pose}"
                     
                     else:
                         print(f"Arrived at waypoint {waypoint + 1} at position {pose}.")
@@ -428,6 +542,7 @@ try:
                 
                 else:
                     if WAYPOINTS[waypoint][2] == "mine":
+                        print(f"Excavating at waypoint {waypoint + 1} at position {pose}.")
                         if i == 0:
                             initial_excavation_time = time.time()
                             i += 1
@@ -438,6 +553,7 @@ try:
                             i = 0
                     
                     elif WAYPOINTS[waypoint][2] == "deposit":
+                        print(f"Depositing at waypoint {waypoint + 1} at position {pose}.")
                         if i == 0:
                             initial_deposit_time = time.time()
                             i += 1
@@ -446,6 +562,11 @@ try:
                             at_waypoint = False
                             waypoint += 1
                             i = 0
+                    
+                    elif WAYPOINTS[waypoint][2] == "temporary":
+                        print("Arrived at temporary waypoint, avoiding obstacle.")
+                        break
+
 
             if cv2.waitKey(1) == ord('q'):
                 break
